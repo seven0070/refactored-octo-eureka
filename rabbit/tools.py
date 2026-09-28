@@ -54,11 +54,6 @@ class ToolRegistry:
         self.register(ToolDef("execute_cmd", "Execute shell/terminal command", RiskLevel.MEDIUM, ["command"]))
         # Filesystem
         self.register(ToolDef("read_file", "Read text from file", RiskLevel.LOW, ["path"]))
-        self.register(ToolDef("write_file", "Write text to file (snapshots on overwrite)", RiskLevel.MEDIUM, ["path", "content"]))
-        self.register(ToolDef("delete_file", "Delete a file (with snapshot)", RiskLevel.HIGH, ["path"]))
-        self.register(ToolDef("list_dir", "List directory contents", RiskLevel.LOW, ["path"]))
-        self.register(ToolDef("file_exists", "Check if file or directory exists", RiskLevel.LOW, ["path"]))
-        # OS & Telemetry
 Rabbit-2B Tool Registry, OS Controller, Hardware Telemetry & Policy Gate
 """
 import os

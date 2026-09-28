@@ -1,0 +1,35 @@
+# Large Model Weights & Checkpoints (Exceeds GitHub 100MB limit)
+abliterated_models/
+quantized_models/
+checkpoints/
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+
+# Cloned External Repositories
+LlamaFactory/
+Model-Optimizer/
+OBLITERATUS/
+heretic/
+
+# Python / Environment / Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.whl
+*.egg-info/
+.pytest_cache/
+
+# Databases & Runtime State
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE & OS
+.vscode/
+.claude/
+.appblink/
+.DS_Store
+Thumbs.db

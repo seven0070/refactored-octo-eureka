@@ -13,6 +13,61 @@ from typing import Dict, Any, List, Optional
 from .core import RiskLevel, FailureClass
 
 
+# --- Workspace confinement (the armour) -------------------------------------
+# Rabbit's model is abliterated - it will never refuse. So safety lives HERE,
+# in code, not in the model. Every file path must resolve inside
+# RABBIT_WORKSPACE (default: ~/rabbit_workspace). Symlinks resolve to their
+# real target, so a symlink pointing outside the workspace fails too.
+
+DEFAULT_WORKSPACE = os.environ.get(
+    "RABBIT_WORKSPACE",
+    os.path.join(os.path.expanduser("~"), "rabbit_workspace")
+)
+
+# Commands matching these patterns are never executed, regardless of approval.
+# Heuristic, not airtight - the hard wall is process isolation (later phase).
+DENIED_COMMAND_PATTERNS = [
+    r"rm\s+-[a-z]*r[a-z]*f\s+/(\s|$)",   # rm -rf /
+    r"\bmkfs\b",                          # format filesystems
+    r"\bformat\s+[a-z]:",                 # Windows format C:
+    r"\bdiskpart\b",
+    r"\bshutdown\b", r"\brestart-computer\b",
+    r"\breg\s+(add|delete|import)\b",    # registry edits
+    r"\bnet\s+(user|localgroup)\b",      # account management
+    r"\b(del|erase)\s+/[sfq]",            # Windows recursive/forced delete
+    r"\brd\s+/s",                         # Windows rd /s
+    r"\b(taskkill\s+/f\s+/im\s+\*)",   # kill everything
+]
+
+def is_denied_command(cmd: str) -> Optional[str]:
+    low = cmd.lower()
+    for pat in DENIED_COMMAND_PATTERNS:
+        if re.search(pat, low):
+            return pat
+    return None
+
+
+class WorkspacePolicy:
+    """Resolves paths and enforces containment under the workspace root."""
+
+    def __init__(self, root: Optional[str] = None):
+        self.root = os.path.realpath(root or DEFAULT_WORKSPACE)
+
+    def resolve(self, path: str) -> str:
+        """Returns the real absolute path inside the workspace, or raises ValueError."""
+        if not path:
+            raise ValueError("empty path")
+        candidate = path
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(self.root, candidate)
+        real = os.path.realpath(candidate)
+        if real != self.root and not real.startswith(self.root + os.sep):
+            raise ValueError(
+                f"Access denied: '{path}' resolves outside the workspace ({self.root})."
+            )
+        return real
+
+
 @dataclass
 class ToolDef:
     name: str
@@ -24,28 +79,50 @@ class ToolDef:
 
 
 class PolicyGate:
-    def __init__(self, auto_approve_medium: bool = True):
-        self.auto_approve_medium = auto_approve_medium
+    """Approval gate. Default: MEDIUM is NOT auto-approved.
 
-    def check(self, tool: ToolDef, args: Dict[str, Any]) -> bool:
+    Server mode (default): gated actions return a confirm token instead of
+    running; the caller (HERMIT) relays it to the user and re-issues the
+    action with the token. Interactive mode (RABBIT_INTERACTIVE=1) keeps the
+    old stdin prompt for standalone CLI use.
+    """
+
+    def __init__(self, auto_approve_medium: bool = False, interactive: Optional[bool] = None):
+        self.auto_approve_medium = auto_approve_medium
+        if interactive is None:
+            interactive = os.environ.get("RABBIT_INTERACTIVE", "").strip() == "1"
+        self.interactive = interactive
+        self.pending: Dict[str, Dict[str, Any]] = {}  # token -> {tool, args}
+
+    def check(self, tool: ToolDef, args: Dict[str, Any]) -> Any:
+        """Returns True (allowed), False (denied), or a confirm token string (needs approval)."""
         if tool.risk == RiskLevel.LOW:
             return True
         if tool.risk == RiskLevel.MEDIUM and self.auto_approve_medium:
             return True
-        # For HIGH or CRITICAL, require explicit prompt
-        print(f"\n[POLICY GATE] Tool '{tool.name}' has risk level {tool.risk.value}.")
-        print(f"  Arguments: {json.dumps(args)}")
-        try:
-            confirm = input("  Authorize execution? [y/N]: ").strip().lower()
-            return confirm == "y"
-        except (KeyboardInterrupt, EOFError):
-            return False
+        if self.interactive:
+            print(f"\n[POLICY GATE] Tool '{tool.name}' has risk level {tool.risk.value}.")
+            print(f"  Arguments: {json.dumps(args)}")
+            try:
+                confirm = input("  Authorize execution? [y/N]: ").strip().lower()
+                return confirm == "y"
+            except (KeyboardInterrupt, EOFError):
+                return False
+        import secrets
+        token = secrets.token_hex(8)
+        self.pending[token] = {"tool": tool.name, "args": args, "risk": tool.risk.value}
+        return token
+
+    def confirm(self, token: str) -> Optional[Dict[str, Any]]:
+        """Pops a pending action for an approved token."""
+        return self.pending.pop(token, None)
 
 
 class ToolRegistry:
-    def __init__(self, policy: Optional[PolicyGate] = None):
+    def __init__(self, policy: Optional[PolicyGate] = None, workspace: Optional[str] = None):
         self.tools: Dict[str, ToolDef] = {}
         self.policy = policy or PolicyGate()
+        self.workspace = WorkspacePolicy(workspace)
         self.snapshots: Dict[str, str] = {}  # file_path -> original_content
         self._register_all()
 
@@ -78,18 +155,55 @@ class ToolRegistry:
             return True
         return False
 
-    def execute(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def confirm(self, token: str) -> Dict[str, Any]:
+        """Executes a previously gated action after user approval."""
+        pending = self.policy.confirm(token)
+        if pending is None:
+            return {"success": False, "error": "Unknown or expired confirm token", "failure_class": FailureClass.PERMISSION_ERROR.value}
+        return self.execute(pending["tool"], pending["args"], _preapproved=True)
+
+    def execute(self, name: str, args: Dict[str, Any], _preapproved: bool = False) -> Dict[str, Any]:
         if name not in self.tools:
             return {"success": False, "error": f"Tool '{name}' not found", "failure_class": FailureClass.TOOL_FAILURE.value}
 
         tool = self.tools[name]
-        if not self.policy.check(tool, args):
-            return {"success": False, "error": "Execution denied by policy", "failure_class": FailureClass.PERMISSION_ERROR.value}
+
+        # Layer B heuristic: catastrophic command patterns are never executed.
+        if name in ("execute_cmd", "verify_condition"):
+            cmd = args.get("command") or args.get("test_cmd") or ""
+            denied = is_denied_command(cmd)
+            if denied:
+                return {"success": False, "error": f"Command blocked by safety policy (pattern: {denied})",
+                        "failure_class": FailureClass.PERMISSION_ERROR.value}
+
+        # Layer A: every path-taking tool is confined to the workspace.
+        if name in ("read_file", "write_file", "delete_file", "list_dir", "file_exists", "git_status", "git_diff"):
+            try:
+                args = dict(args)
+                args["path"] = self.workspace.resolve(args.get("path", "."))
+            except ValueError as e:
+                return {"success": False, "error": str(e), "failure_class": FailureClass.PERMISSION_ERROR.value}
+
+        if not _preapproved:
+            gate = self.policy.check(tool, args)
+            if gate is False:
+                return {"success": False, "error": "Execution denied by policy", "failure_class": FailureClass.PERMISSION_ERROR.value}
+            if isinstance(gate, str):
+                return {
+                    "success": False,
+                    "authorization_required": True,
+                    "confirm_token": gate,
+                    "tool": name,
+                    "args": args,
+                    "risk": tool.risk.value,
+                    "error": f"Tool '{name}' (risk {tool.risk.value}) requires user approval. Re-issue with confirm_token to proceed.",
+                    "failure_class": FailureClass.PERMISSION_ERROR.value,
+                }
 
         try:
             if name == "execute_cmd":
                 cmd = args.get("command", "")
-                cwd = args.get("cwd", os.getcwd())
+                cwd = args.get("cwd", self.workspace.root)
                 res = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=tool.timeout_sec)
                 return {
                     "stdout": res.stdout,
@@ -188,12 +302,14 @@ class ToolRegistry:
 
 
 def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    pattern = r'<function name="([^"]+)">([\s\S]*?)</function>'
+    # Accept single- AND double-quoted attribute values; the execution prompt
+    # shows single quotes, so both must parse.
+    pattern = r"""<function name=["']([^"']+)["']>([\s\S]*?)</function>"""
     matches = re.findall(pattern, text)
     calls = []
     for name, body in matches:
         params = {}
-        for p_match in re.finditer(r'<param name="([^"]+)">([\s\S]*?)</param>', body):
+        for p_match in re.finditer(r"""<param name=["']([^"']+)["']>([\s\S]*?)</param>""", body):
             p_name, p_val = p_match.group(1), p_match.group(2).strip()
             params[p_name] = p_val
         calls.append({"name": name, "params": params})

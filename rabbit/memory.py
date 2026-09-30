@@ -11,7 +11,12 @@ from .core import TaskStatus
 
 
 class PersistentMemory:
-    def __init__(self, db_path: str = r"d:\RAD\model optimizer\rabbit_state.db"):
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path is None:
+            db_path = os.environ.get(
+                "RABBIT_DB_PATH",
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "rabbit_state.db")
+            )
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_tables()

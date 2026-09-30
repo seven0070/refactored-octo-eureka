@@ -4,6 +4,7 @@ Coordinates the complete lifecycle:
 Understand -> Decide -> Plan -> Authorize -> Schedule -> Execute -> Observe -> Verify -> Recover -> Complete
 """
 import os
+import re
 import sys
 import time
 import json
@@ -158,6 +159,18 @@ Output strictly valid JSON with this structure:
                 self.usage.tool_calls += 1
                 obs = self.tools.execute(t_name, t_params)
 
+            if obs.get("authorization_required"):
+                print(f"  [AUTHORIZATION REQUIRED] {obs.get('error')}")
+                self.state = AgentState.PAUSED
+                return {
+                    "status": "AUTHORIZATION_REQUIRED",
+                    "confirm_token": obs["confirm_token"],
+                    "pending_tool": obs.get("tool"),
+                    "pending_args": obs.get("args"),
+                    "risk": obs.get("risk"),
+                    "run_id": run_id,
+                }
+
             self.state = AgentState.OBSERVE
             print(f"  [Observation]: {json.dumps(obs, default=str)[:300]}")
 
@@ -199,7 +212,12 @@ Output strictly valid JSON with this structure:
             "evidence": {t.task_id: t.result for t in dag.nodes.values()}
         }
 
-    def run(self, objective: str) -> Dict[str, Any]:
+    def run(self, objective: str = "", confirm_token: str = "") -> Dict[str, Any]:
+        # Approval path: execute a previously gated action after user confirm.
+        if confirm_token:
+            obs = self.tools.confirm(confirm_token)
+            return {"status": "CONFIRMED_EXECUTION", "result": obs}
+
         run_id = f"run_{int(time.time()*1000)}"
         self.usage = ResourceUsage()
         self.state = AgentState.UNDERSTAND
@@ -234,6 +252,15 @@ Output strictly valid JSON with this structure:
             calls = parse_tool_calls(resp)
             if calls:
                 obs = self.tools.execute(calls[0]["name"], calls[0]["params"])
+                if obs.get("authorization_required"):
+                    self.state = AgentState.PAUSED
+                    return {
+                        "status": "AUTHORIZATION_REQUIRED",
+                        "confirm_token": obs["confirm_token"],
+                        "pending_tool": obs.get("tool"),
+                        "pending_args": obs.get("args"),
+                        "risk": obs.get("risk"),
+                    }
                 self.state = AgentState.COMPLETE
                 return {"status": "COMPLETED", "decision": "TOOL", "result": obs}
             return {"status": "COMPLETED", "decision": "TOOL", "result": resp}

@@ -1,6 +1,6 @@
 # Rabbit-2B: Sovereign Local Autonomous Super Agent
 
-[![Tests](https://img.shields.io/badge/tests-7%2F7%20passing-brightgreen)](#automated-testing)
+[![Tests](https://img.shields.io/badge/tests-20%2F20%20passing-brightgreen)](#automated-testing)
 [![Model](https://img.shields.io/badge/model-MiniCPM5--2B--DoubleAbliterated-blue)](#model-architecture)
 [![Quantization](https://img.shields.io/badge/quantization-NVIDIA%20ModelOpt%20FP8-purple)](#quantization)
 [![Decision Engine](https://img.shields.io/badge/decision-LAVOIR%20(arXiv:2609.30706)-orange)](#lavoir-decision-engine)
@@ -35,12 +35,26 @@ It combines double-pass refusal ablation, cognitive persona alignment, NVIDIA Mo
 5. **Sovereign Autonomous Runtime (`rabbit/`)**:
    - **Hierarchical Planner:** Decomposes complex objectives into DAGs (Directed Acyclic Graphs) with strict topological dependency resolution.
    - **Tool Registry:** 12 deterministic host-level tools (filesystem, shell, processes, Git, inspection).
-   - **Policy Gate:** Enforces workspace confinement and prevents unauthorized destructive actions.
+   - **Policy Gate & Workspace Confinement:** Because the model is abliterated (never refuses), safety lives in code, not the model:
+     - **Layer A (airtight):** every file path resolves via `realpath` and must stay inside `RABBIT_WORKSPACE` (default `~/rabbit_workspace`). Absolute escapes, `..` escapes, and symlinks pointing outside are denied.
+     - **Layer B (heuristic + approval):** catastrophic command patterns are denylisted outright; MEDIUM/HIGH/CRITICAL tools require a single-use confirm token (`authorization_required` -> caller relays to the user -> `confirm(token)`), or interactive `[y/N]` prompts when `RABBIT_INTERACTIVE=1`.
+     - **Layer C (planned):** OS-level process confinement (restricted account / container). Until then, treat shell-command filtering as heuristic, not a wall.
    - **Verification Engine:** Evidence-first verification (exit codes, regex match, hash assertions) before marking any task as complete.
    - **Auto-Recovery & Rollback:** Up to 2 automatic recovery attempts before halting safely to avoid cascading failures.
    - **ACID Persistence:** SQLite state store (`rabbit_state.db`) tracking tasks, episodes, and audit logs.
 
 ---
+
+## Configuration (environment variables)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RABBIT_WORKSPACE` | `~/rabbit_workspace` | Sole directory the file tools may touch |
+| `RABBIT_INTERACTIVE` | unset | `1` = stdin `[y/N]` approval prompts (standalone CLI); unset = confirm-token flow for server use |
+| `RABBIT_MODEL_URL` | unset | OpenAI-compatible endpoint (e.g. a shared vLLM server); preferred over local weights |
+| `RABBIT_MODEL_NAME` | `MiniCPM5-2B-FP8` | Model name requested at that endpoint |
+| `RABBIT_MODEL_PATH` | `./models/Rabbit-2B` | Local weights for the offline transformers fallback |
+| `RABBIT_DB_PATH` | `./data/rabbit_state.db` | SQLite audit/state database |
 
 ## Directory Layout
 
